@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 
+import csv
 import json
 import locale
+import math
+import os
 import warnings
 from collections import Counter, OrderedDict
 from decimal import Decimal
@@ -182,19 +185,18 @@ class CSVStat(CSVKitUtility):
             return
 
         sniff_limit = self.args.sniff_limit if self.args.sniff_limit != -1 else None
-        table = agate.Table.from_csv(
-            self.input_file,
-            skip_lines=self.args.skip_lines,
-            sniff_limit=sniff_limit,
-            column_types=self.get_column_types(),
-            **self.reader_kwargs,
-        )
+        table = self.read_table(sniff_limit)
 
         column_ids = parse_column_identifiers(
             self.args.columns,
             table.column_names,
             self.get_column_offset(),
         )
+
+        self.table = table
+        self.column_ids = column_ids
+        self.column_names_used = [table.column_names[i] for i in column_ids]
+        self.row_count = len(table.rows)
 
         kwargs = {}
 
@@ -214,12 +216,76 @@ class CSVStat(CSVKitUtility):
             for column_id in column_ids:
                 stats[column_id] = self.calculate_stats(table, column_id, **kwargs)
 
+            self.stats = stats
+
             if self.args.csv_output:
                 self.print_csv(table, column_ids, stats)
             elif self.args.json_output:
                 self.print_json(table, column_ids, stats)
             else:
                 self.print_stats(table, column_ids, stats)
+
+    def read_table(self, sniff_limit):
+        column_types = self.get_column_types()
+        if not os.getenv('CSVKIT_NO_OPT_3'):
+            sampled = self.sample_column_types()
+            if sampled is not None:
+                position = self.input_file.tell()
+                try:
+                    return agate.Table.from_csv(
+                        self.input_file,
+                        skip_lines=self.args.skip_lines,
+                        sniff_limit=sniff_limit,
+                        column_types=sampled,
+                        **self.reader_kwargs,
+                    )
+                except Exception:
+                    self.input_file.seek(position)
+
+        return agate.Table.from_csv(
+            self.input_file,
+            skip_lines=self.args.skip_lines,
+            sniff_limit=sniff_limit,
+            column_types=column_types,
+            **self.reader_kwargs,
+        )
+
+    def sample_column_types(self, sample_rows=1000):
+        path = getattr(self.args, 'input_path', None)
+        if not path or path == '-':
+            return None
+
+        candidates = self.get_column_type_candidates()
+        reader_kwargs = {k: v for k, v in self.reader_kwargs.items() if k != 'header'}
+        f = self._open_input_file(path)
+        try:
+            for _ in range(self.args.skip_lines):
+                f.readline()
+            rows = agate.csv.reader(f, **reader_kwargs)
+            if not self.args.no_header_row:
+                next(rows, None)
+            sample = [row for row, _ in zip(rows, range(sample_rows))]
+        except (OSError, UnicodeDecodeError, csv.Error):
+            return None
+        finally:
+            f.close()
+
+        if not sample or len({len(row) for row in sample}) != 1:
+            return None
+
+        types = []
+        for column in zip(*sample):
+            for column_type in candidates:
+                try:
+                    for value in column:
+                        column_type.cast(value)
+                except agate.CastError:
+                    continue
+                types.append(column_type)
+                break
+            else:
+                types.append(candidates[-1])
+        return types
 
     def is_finite_decimal(self, value):
         return isinstance(value, Decimal) and value.is_finite()
@@ -266,6 +332,16 @@ class CSVStat(CSVKitUtility):
         """
         Calculate stats for all valid operations.
         """
+        if not os.getenv('CSVKIT_NO_FASTSTATS'):
+            stats = calculate_stats_in_one_pass(table.columns[column_id], **kwargs)
+            if stats is not None:
+                if not self.args.json_output:
+                    for op_name, value in stats.items():
+                        if self.is_finite_decimal(value):
+                            stats[op_name] = format_decimal(
+                                value, self.args.decimal_format, self.args.no_grouping_separator)
+                return stats
+
         return {
             op_name: self._calculate_stat(table, column_id, op_name, op_data, **kwargs)
             for op_name, op_data in OPERATIONS.items()
@@ -361,6 +437,59 @@ class CSVStat(CSVKitUtility):
                     output_row[op_name] = column_stats[op_name]
 
             yield output_row
+
+
+def calculate_stats_in_one_pass(column, freq_count=5):
+    data_type = column.data_type
+    is_number = isinstance(data_type, agate.Number)
+    is_text = isinstance(data_type, agate.Text)
+    orderable = is_number or isinstance(data_type, (agate.Date, agate.DateTime, agate.TimeDelta))
+    if not (orderable or is_text or isinstance(data_type, agate.Boolean)):
+        return None
+
+    values = column.values()
+    counts = Counter(values)
+    has_nulls = None in counts
+    non_null = [v for v in values if v is not None] if has_nulls else values
+    n = len(non_null)
+
+    stats = dict.fromkeys(OPERATIONS)
+    stats['type'] = data_type.__class__.__name__
+    stats['nulls'] = has_nulls
+    stats['nonnulls'] = n
+    stats['unique'] = len(counts)
+    stats['freq'] = [{'value': value, 'count': count}
+                     for value, count in counts.most_common(freq_count)]
+
+    if is_text:
+        stats['len'] = Decimal(max((len(v) for v in non_null), default=0))
+
+    if n and orderable:
+        stats['min'] = min(non_null)
+        stats['max'] = max(non_null)
+
+    if n and is_number:
+        total = sum(non_null)
+        mean = total / n
+        stats['sum'] = total
+        stats['mean'] = mean
+        stats['median'] = _percentile(sorted(non_null), 50)
+        if n > 1:
+            stats['stdev'] = (sum((v - mean) ** 2 for v in non_null) / (n - 1)).sqrt()
+        stats['maxprecision'] = Decimal(max(max(-v.as_tuple().exponent, 0) for v in non_null))
+
+    return stats
+
+
+def _percentile(data, percentile):
+    k = (len(data) - 1) * (Decimal(percentile) / 100)
+    f = math.floor(k)
+    c = math.ceil(k)
+
+    if f == c:
+        return Decimal(data[int(k)])
+
+    return (data[f] * (c - k)) + (data[c] * (k - f))
 
 
 def format_decimal(d, f='%.3f', no_grouping_separator=False):

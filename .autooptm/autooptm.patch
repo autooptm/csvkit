@@ -1,0 +1,336 @@
+diff --git a/csvkit/cli.py b/csvkit/cli.py
+index e99acad34e0d0eac9d003e0c119867b7d1496934..72ce6b0ba317174836d020ad4d4b90bcc425e5aa 100644
+--- a/csvkit/cli.py
++++ b/csvkit/cli.py
+@@ -19,6 +19,7 @@ from os.path import splitext
+ import agate
+ from agate.data_types.base import DEFAULT_NULL_VALUES
+ 
++from csvkit import fastcast
+ from csvkit.exceptions import ColumnIdentifierError, RequiredHeaderError
+ 
+ try:
+@@ -350,6 +351,9 @@ class CSVKitUtility:
+         sys.excepthook = handler
+ 
+     def get_column_types(self):
++        return agate.TypeTester(types=self.get_column_type_candidates())
++
++    def get_column_type_candidates(self):
+         if getattr(self.args, 'blanks', None):
+             type_kwargs = {'null_values': []}
+         else:
+@@ -357,12 +361,14 @@ class CSVKitUtility:
+         for null_value in getattr(self.args, 'null_values', []):
+             type_kwargs['null_values'].append(null_value)
+ 
++        number_class, date_class, datetime_class = fastcast.types()
++
+         text_type = agate.Text(**type_kwargs)
+ 
+         if getattr(self.args, 'no_inference', None):
+             types = [text_type]
+         else:
+-            number_type = agate.Number(
++            number_type = number_class(
+                 locale=self.args.locale, no_leading_zeroes=getattr(self.args, 'no_leading_zeroes', None), **type_kwargs
+             )
+ 
+@@ -373,8 +379,8 @@ class CSVKitUtility:
+                 types = [
+                     agate.Boolean(**type_kwargs),
+                     agate.TimeDelta(**type_kwargs),
+-                    agate.Date(date_format=self.args.date_format, **type_kwargs),
+-                    agate.DateTime(datetime_format=self.args.datetime_format, **type_kwargs),
++                    date_class(date_format=self.args.date_format, **type_kwargs),
++                    datetime_class(datetime_format=self.args.datetime_format, **type_kwargs),
+                     text_type,
+                 ]
+ 
+@@ -386,7 +392,7 @@ class CSVKitUtility:
+                 else:
+                     types.insert(1, number_type)
+ 
+-        return agate.TypeTester(types=types)
++        return types
+ 
+     def get_column_offset(self):
+         if self.args.zero_based:
+diff --git a/csvkit/fastcast.py b/csvkit/fastcast.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8967cc5fd8685e6e3810cece712f5e57746f62d3
+--- /dev/null
++++ b/csvkit/fastcast.py
+@@ -0,0 +1,75 @@
++
++import datetime as _datetime
++import os
++import re
++from decimal import Decimal
++
++import agate
++
++
++class _Verified:
++
++    _fast_ok = None
++
++    def _shortcut(self, value):
++        raise NotImplementedError
++
++    def cast(self, d):
++        if self._fast_ok is not False and type(d) is str:
++            fast = self._shortcut(d)
++            if fast is not None:
++                if self._fast_ok is None:
++                    self._fast_ok = fast == super().cast(d)
++                    if not self._fast_ok:
++                        return super().cast(d)
++                return fast
++        return super().cast(d)
++
++
++class Date(_Verified, agate.Date):
++    _ISO = re.compile(r'\A(\d{4})-(\d{2})-(\d{2})\Z')
++
++    def _shortcut(self, d):
++        if self.date_format is not None:
++            return None
++        m = self._ISO.match(d.strip())
++        if m is None:
++            return None
++        try:
++            return _datetime.date(int(m[1]), int(m[2]), int(m[3]))
++        except ValueError:
++            return None
++
++
++class DateTime(_Verified, agate.DateTime):
++    _ISO = re.compile(r'\A(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})\Z')
++
++    def _shortcut(self, d):
++        if self.datetime_format is not None or getattr(self, 'timezone', None) is not None:
++            return None
++        m = self._ISO.match(d.strip())
++        if m is None:
++            return None
++        try:
++            return _datetime.datetime(int(m[1]), int(m[2]), int(m[3]),
++                                      int(m[4]), int(m[5]), int(m[6]))
++        except ValueError:
++            return None
++
++
++class Number(_Verified, agate.Number):
++    _PLAIN = re.compile(r'\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z')
++
++    def _shortcut(self, d):
++        s = d.strip()
++        if self._PLAIN.match(s) is None:
++            return None
++        return Decimal(s)
++
++
++def types():
++    if os.getenv('CSVKIT_NO_FASTCAST'):
++        return agate.Number, agate.Date, agate.DateTime
++    return (agate.Number if os.getenv('CSVKIT_FASTCAST_NUMBER') == '0' else Number,
++            agate.Date if os.getenv('CSVKIT_FASTCAST_DATE') == '0' else Date,
++            agate.DateTime if os.getenv('CSVKIT_FASTCAST_DATE') == '0' else DateTime)
+diff --git a/csvkit/utilities/csvstat.py b/csvkit/utilities/csvstat.py
+index 052a75d883e93fe3dafdff1b2ba098c3a661ee13..eecb3a6bddcdda1dbb1a3d4c3a4b6f8c50e4e86d 100644
+--- a/csvkit/utilities/csvstat.py
++++ b/csvkit/utilities/csvstat.py
+@@ -1,7 +1,10 @@
+ #!/usr/bin/env python
+ 
++import csv
+ import json
+ import locale
++import math
++import os
+ import warnings
+ from collections import Counter, OrderedDict
+ from decimal import Decimal
+@@ -182,13 +185,7 @@ class CSVStat(CSVKitUtility):
+             return
+ 
+         sniff_limit = self.args.sniff_limit if self.args.sniff_limit != -1 else None
+-        table = agate.Table.from_csv(
+-            self.input_file,
+-            skip_lines=self.args.skip_lines,
+-            sniff_limit=sniff_limit,
+-            column_types=self.get_column_types(),
+-            **self.reader_kwargs,
+-        )
++        table = self.read_table(sniff_limit)
+ 
+         column_ids = parse_column_identifiers(
+             self.args.columns,
+@@ -196,6 +193,11 @@ class CSVStat(CSVKitUtility):
+             self.get_column_offset(),
+         )
+ 
++        self.table = table
++        self.column_ids = column_ids
++        self.column_names_used = [table.column_names[i] for i in column_ids]
++        self.row_count = len(table.rows)
++
+         kwargs = {}
+ 
+         if self.args.freq_count:
+@@ -214,6 +216,8 @@ class CSVStat(CSVKitUtility):
+             for column_id in column_ids:
+                 stats[column_id] = self.calculate_stats(table, column_id, **kwargs)
+ 
++            self.stats = stats
++
+             if self.args.csv_output:
+                 self.print_csv(table, column_ids, stats)
+             elif self.args.json_output:
+@@ -221,6 +225,68 @@ class CSVStat(CSVKitUtility):
+             else:
+                 self.print_stats(table, column_ids, stats)
+ 
++    def read_table(self, sniff_limit):
++        column_types = self.get_column_types()
++        if not os.getenv('CSVKIT_NO_OPT_3'):
++            sampled = self.sample_column_types()
++            if sampled is not None:
++                position = self.input_file.tell()
++                try:
++                    return agate.Table.from_csv(
++                        self.input_file,
++                        skip_lines=self.args.skip_lines,
++                        sniff_limit=sniff_limit,
++                        column_types=sampled,
++                        **self.reader_kwargs,
++                    )
++                except Exception:
++                    self.input_file.seek(position)
++
++        return agate.Table.from_csv(
++            self.input_file,
++            skip_lines=self.args.skip_lines,
++            sniff_limit=sniff_limit,
++            column_types=column_types,
++            **self.reader_kwargs,
++        )
++
++    def sample_column_types(self, sample_rows=1000):
++        path = getattr(self.args, 'input_path', None)
++        if not path or path == '-':
++            return None
++
++        candidates = self.get_column_type_candidates()
++        reader_kwargs = {k: v for k, v in self.reader_kwargs.items() if k != 'header'}
++        f = self._open_input_file(path)
++        try:
++            for _ in range(self.args.skip_lines):
++                f.readline()
++            rows = agate.csv.reader(f, **reader_kwargs)
++            if not self.args.no_header_row:
++                next(rows, None)
++            sample = [row for row, _ in zip(rows, range(sample_rows))]
++        except (OSError, UnicodeDecodeError, csv.Error):
++            return None
++        finally:
++            f.close()
++
++        if not sample or len({len(row) for row in sample}) != 1:
++            return None
++
++        types = []
++        for column in zip(*sample):
++            for column_type in candidates:
++                try:
++                    for value in column:
++                        column_type.cast(value)
++                except agate.CastError:
++                    continue
++                types.append(column_type)
++                break
++            else:
++                types.append(candidates[-1])
++        return types
++
+     def is_finite_decimal(self, value):
+         return isinstance(value, Decimal) and value.is_finite()
+ 
+@@ -266,6 +332,16 @@ class CSVStat(CSVKitUtility):
+         """
+         Calculate stats for all valid operations.
+         """
++        if not os.getenv('CSVKIT_NO_FASTSTATS'):
++            stats = calculate_stats_in_one_pass(table.columns[column_id], **kwargs)
++            if stats is not None:
++                if not self.args.json_output:
++                    for op_name, value in stats.items():
++                        if self.is_finite_decimal(value):
++                            stats[op_name] = format_decimal(
++                                value, self.args.decimal_format, self.args.no_grouping_separator)
++                return stats
++
+         return {
+             op_name: self._calculate_stat(table, column_id, op_name, op_data, **kwargs)
+             for op_name, op_data in OPERATIONS.items()
+@@ -363,6 +439,59 @@ class CSVStat(CSVKitUtility):
+             yield output_row
+ 
+ 
++def calculate_stats_in_one_pass(column, freq_count=5):
++    data_type = column.data_type
++    is_number = isinstance(data_type, agate.Number)
++    is_text = isinstance(data_type, agate.Text)
++    orderable = is_number or isinstance(data_type, (agate.Date, agate.DateTime, agate.TimeDelta))
++    if not (orderable or is_text or isinstance(data_type, agate.Boolean)):
++        return None
++
++    values = column.values()
++    counts = Counter(values)
++    has_nulls = None in counts
++    non_null = [v for v in values if v is not None] if has_nulls else values
++    n = len(non_null)
++
++    stats = dict.fromkeys(OPERATIONS)
++    stats['type'] = data_type.__class__.__name__
++    stats['nulls'] = has_nulls
++    stats['nonnulls'] = n
++    stats['unique'] = len(counts)
++    stats['freq'] = [{'value': value, 'count': count}
++                     for value, count in counts.most_common(freq_count)]
++
++    if is_text:
++        stats['len'] = Decimal(max((len(v) for v in non_null), default=0))
++
++    if n and orderable:
++        stats['min'] = min(non_null)
++        stats['max'] = max(non_null)
++
++    if n and is_number:
++        total = sum(non_null)
++        mean = total / n
++        stats['sum'] = total
++        stats['mean'] = mean
++        stats['median'] = _percentile(sorted(non_null), 50)
++        if n > 1:
++            stats['stdev'] = (sum((v - mean) ** 2 for v in non_null) / (n - 1)).sqrt()
++        stats['maxprecision'] = Decimal(max(max(-v.as_tuple().exponent, 0) for v in non_null))
++
++    return stats
++
++
++def _percentile(data, percentile):
++    k = (len(data) - 1) * (Decimal(percentile) / 100)
++    f = math.floor(k)
++    c = math.ceil(k)
++
++    if f == c:
++        return Decimal(data[int(k)])
++
++    return (data[f] * (c - k)) + (data[c] * (k - f))
++
++
+ def format_decimal(d, f='%.3f', no_grouping_separator=False):
+     return locale.format_string(f, d, grouping=not no_grouping_separator).rstrip('0').rstrip('.')
+ 

@@ -19,6 +19,7 @@ from os.path import splitext
 import agate
 from agate.data_types.base import DEFAULT_NULL_VALUES
 
+from csvkit import fastcast
 from csvkit.exceptions import ColumnIdentifierError, RequiredHeaderError
 
 try:
@@ -350,6 +351,9 @@ class CSVKitUtility:
         sys.excepthook = handler
 
     def get_column_types(self):
+        return agate.TypeTester(types=self.get_column_type_candidates())
+
+    def get_column_type_candidates(self):
         if getattr(self.args, 'blanks', None):
             type_kwargs = {'null_values': []}
         else:
@@ -357,12 +361,14 @@ class CSVKitUtility:
         for null_value in getattr(self.args, 'null_values', []):
             type_kwargs['null_values'].append(null_value)
 
+        number_class, date_class, datetime_class = fastcast.types()
+
         text_type = agate.Text(**type_kwargs)
 
         if getattr(self.args, 'no_inference', None):
             types = [text_type]
         else:
-            number_type = agate.Number(
+            number_type = number_class(
                 locale=self.args.locale, no_leading_zeroes=getattr(self.args, 'no_leading_zeroes', None), **type_kwargs
             )
 
@@ -373,8 +379,8 @@ class CSVKitUtility:
                 types = [
                     agate.Boolean(**type_kwargs),
                     agate.TimeDelta(**type_kwargs),
-                    agate.Date(date_format=self.args.date_format, **type_kwargs),
-                    agate.DateTime(datetime_format=self.args.datetime_format, **type_kwargs),
+                    date_class(date_format=self.args.date_format, **type_kwargs),
+                    datetime_class(datetime_format=self.args.datetime_format, **type_kwargs),
                     text_type,
                 ]
 
@@ -386,7 +392,7 @@ class CSVKitUtility:
                 else:
                     types.insert(1, number_type)
 
-        return agate.TypeTester(types=types)
+        return types
 
     def get_column_offset(self):
         if self.args.zero_based:
